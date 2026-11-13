@@ -301,12 +301,81 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// ============================================================================
+// The whatsmeow store container is created ONCE and shared by every instance.
+//
+// StartClient used to call sqlstore.New on every (re)connect, QR restart and
+// LoggedOut restart, never closing the previous container. Each sqlstore.New
+// opens its own *sql.DB with no MaxOpenConns, so every cycle leaked a whole
+// connection pool until Postgres (or the role's CONNECTION LIMIT) was exhausted
+// and every instance that dropped its websocket failed to come back.
+//
+// Upstream: evolution-foundation/evolution-go issues #106 #112 #118 #165 #175 #215,
+// PRs #131 #178 #194 (none merged as of 2026-11).
+//
+// With Postgres, the container reuses the already capped authDB pool
+// (DB_AUTH_MAX_OPEN_CONNS, default 8) instead of opening another one.
+// The error is not memoized (Mutex, not sync.Once): a database briefly down on
+// the first attempt must not poison the process for its whole lifetime.
+// ============================================================================
+
+var (
+	sharedContainerMu sync.Mutex
+	sharedStore       *sqlstore.Container
+)
+
+func sharedContainer(w whatsmeowService) (*sqlstore.Container, error) {
+	sharedContainerMu.Lock()
+	defer sharedContainerMu.Unlock()
+
+	if sharedStore != nil {
+		return sharedStore, nil
+	}
+
+	var dbLog waLog.Logger
+	if w.config.WaDebug != "" {
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	var container *sqlstore.Container
+	var err error
+	switch {
+	case w.config.PostgresAuthDB != "":
+		db := w.authDB
+		ownPool := false
+		if db == nil {
+			// Normally main passes authDB in; fall back to our own capped pool.
+			if db, err = sql.Open("postgres", w.config.PostgresAuthDB); err != nil {
+				return nil, fmt.Errorf("failed to open database: %w", err)
+			}
+			config.ApplyPoolLimits(db, "DB_AUTH_MAX_OPEN_CONNS", 8)
+			ownPool = true
+		}
+		container = sqlstore.NewWithDB(db, "postgres", dbLog)
+		if err = container.Upgrade(context.Background()); err != nil {
+			// Only close a pool we opened here; authDB belongs to main and is still in use.
+			if ownPool {
+				_ = db.Close()
+			}
+			return nil, fmt.Errorf("failed to upgrade database: %w", err)
+		}
+	default:
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	sharedStore = container
+	return container, nil
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
 
 	var deviceStore *store.Device
-	var err error
 
 	if w.clientPointer[cd.Instance.Id] != nil {
 		if w.clientPointer[cd.Instance.Id].IsConnected() {
@@ -314,24 +383,8 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
+	// One shared container for every instance — see sharedContainer.
+	container, err := sharedContainer(w)
 
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)

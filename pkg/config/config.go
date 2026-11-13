@@ -169,12 +169,30 @@ func (c *Config) CreateUsersDB() (*gorm.DB, error) {
 	}
 
 	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	sqlDB.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	sqlDB.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
-	sqlDB.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
-	sqlDB.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
+	ApplyPoolLimits(sqlDB, "DB_USERS_MAX_OPEN_CONNS", 5)
 
 	return db, nil
+}
+
+// ApplyPoolLimits caps a *sql.DB pool. Every Postgres pool in the process must go
+// through here: the Postgres role used by Evolution GO usually has a CONNECTION
+// LIMIT, and pools without a cap (or several pools of 25) exceed it, which makes
+// whatsmeow fail to persist session keys and drops the instances.
+//
+// envKey lets the operator override the max open connections (e.g. DB_AUTH_MAX_OPEN_CONNS=10).
+func ApplyPoolLimits(db *sql.DB, envKey string, defaultMaxOpen int) {
+	maxOpen := defaultMaxOpen
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(envKey))); err == nil && v > 0 {
+		maxOpen = v
+	}
+	maxIdle := 2
+	if maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
+	db.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
 }
 
 func (c *Config) CreateAuthDB() (*sql.DB, error) {
@@ -194,10 +212,7 @@ func (c *Config) CreateAuthDB() (*sql.DB, error) {
 	}
 
 	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	db.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	db.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
-	db.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
-	db.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
+	ApplyPoolLimits(db, "DB_USERS_MAX_OPEN_CONNS", 5)
 
 	// Testar a conexão
 	err = db.Ping()
